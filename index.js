@@ -594,10 +594,87 @@ app.patch("/profile", auth, async (req, res) => {
   /* ----------------------------- Read ----------------------------- */
 
   // Public list kept for backwards compatibility with the existing action.
-  app.get("/add-tuitions", async (req, res) => {
-    const data = await tuitions.find({}).sort({ createdAt: -1 }).toArray();
+app.get("/add-tuitions", async (req, res) => {
+  try {
+    const {
+      q,
+      subject,
+      classLevel,
+      mode,
+      minFee,
+      maxFee,
+    } = req.query;
+
+    const query = {
+      approvalStatus: "approved",
+      isActive: { $ne: false },
+    };
+
+    // Search tuition title using case-insensitive regex
+    if (q && typeof q === "string" && q.trim()) {
+      const escapedSearch = q.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      query.title = {
+        $regex: escapedSearch,
+        $options: "i",
+      };
+    }
+
+    // Subject filter
+    if (subject && typeof subject === "string") {
+      query.subject = subject;
+    }
+
+    // Class level filter
+    if (classLevel && typeof classLevel === "string") {
+      query.classLevel = classLevel;
+    }
+
+    // Online / Offline filter
+    if (mode && typeof mode === "string") {
+      query.mode = {
+        $regex: `^${mode}$`,
+        $options: "i",
+      };
+    }
+
+    // Monthly fee range
+    const feeFilter = {};
+
+    if (minFee !== undefined) {
+      const min = Number(minFee);
+
+      if (Number.isFinite(min) && min >= 0) {
+        feeFilter.$gte = min;
+      }
+    }
+
+    if (maxFee !== undefined) {
+      const max = Number(maxFee);
+
+      if (Number.isFinite(max) && max >= 0) {
+        feeFilter.$lte = max;
+      }
+    }
+
+    if (Object.keys(feeFilter).length > 0) {
+      query.monthlyFee = feeFilter;
+    }
+
+    const data = await tuitions
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
     res.send(data);
-  });
+  } catch (error) {
+    console.error("Browse tuitions error:", error);
+
+    res.status(500).send({
+      message: "Failed to fetch tuitions",
+    });
+  }
+});
 
   // Only the logged-in tutor's tuitions. Must be declared before "/tuitions/:id".
   app.get("/tuitions/mine", auth, async (req, res) => {
