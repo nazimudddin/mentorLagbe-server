@@ -16,7 +16,31 @@ const STRIPE_SECRET_KEY =
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
 
 const FREE_TUITION_LIMIT = 2;
-const PRO_PLAN_AMOUNT = 1500; // $15.00 in cents.
+const FREE_SAVED_TUITION_LIMIT = 5;
+
+// Paid plans. Amounts are in cents and are used both for Checkout and as a
+// fallback when a Stripe Session does not include amount_total.
+const PRO_PLANS = {
+  tutor_pro: {
+    role: "tutor",
+    amount: 1500, // $15.00
+    name: "MentorLagbe Tutor Pro",
+    description: "Unlimited tuition posts on MentorLagbe.",
+    successPath: "/dashboard/tutor/post-tuition",
+    cancelPath: "/dashboard/tutor/post-tuition",
+  },
+  student_pro: {
+    role: "student",
+    amount: 1000, // $10.00
+    name: "MentorLagbe Student Pro",
+    description: "Unlimited saved tuitions, Pro badge, and priority booking.",
+    successPath: "/dashboard/student/upgrade-pro",
+    cancelPath: "/dashboard/student/upgrade-pro",
+    // Keep the assignment price in USD instead of letting Stripe present a
+    // localized currency at checkout.
+    adaptivePricing: false,
+  },
+};
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
@@ -85,10 +109,47 @@ function toPublicApplication(doc) {
     preferredSchedule: rest.preferredSchedule || rest.schedule || "",
     note: rest.note || rest.message || "",
     status: rest.status || "pending",
+    // Student Pro applications are highlighted for tutors. The plan is joined
+    // live (see withStudentPlans) so an upgrade applies to existing applications.
+    studentPlan: rest.studentPlan === "pro" ? "pro" : "free",
+    studentIsPro: rest.studentPlan === "pro",
     tutorId: rest.tutorId,
     tutorEmail: rest.tutorEmail,
     createdAt: rest.createdAt || rest.appliedAt,
     updatedAt: rest.updatedAt,
+  };
+}
+
+function toPublicProfile(user) {
+  if (!user) return null;
+
+  return {
+    id: String(user._id),
+    name: user.name || "",
+    email: user.email || "",
+    phone: user.phone || "",
+    address: user.address || "",
+    bio: user.bio || "",
+    image: user.image || "",
+    role: user.role || "student",
+    plan: user.plan || "free",
+    proSince: user.proSince || null,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
+}
+
+function toAdminUser(user) {
+  if (!user) return null;
+
+  return {
+    id: String(user._id),
+    name: user.name || "",
+    email: user.email || "",
+    role: user.role || "student",
+    plan: user.plan || "free",
+    createdAt: user.createdAt || null,
+    updatedAt: user.updatedAt || null,
   };
 }
 
@@ -129,8 +190,67 @@ function ownerFilter(user) {
   };
 }
 
-// Marks a verified Stripe Checkout Session as paid and upgrades the tutor.
-// This is the only place the user's plan is changed, so an upgrade can never
+// Attach the student's current plan to applications. The plan is looked up
+// live rather than snapshotted at apply time so Student Pro highlighting is
+// immediately visible on existing applications after an upgrade.
+async function withStudentPlans(db, applications) {
+  if (!Array.isArray(applications) || applications.length === 0) {
+    return [];
+  }
+
+  const studentIds = [
+    ...new Set(
+      applications.map((application) => application.studentId).filter(Boolean)
+    ),
+  ]
+    .map(toObjectId)
+    .filter(Boolean);
+
+  const planByStudent = new Map();
+
+  if (studentIds.length > 0) {
+    const students = await db
+      .collection("user")
+      .find({ _id: { $in: studentIds } })
+      .project({ plan: 1 })
+      .toArray();
+
+    for (const student of students) {
+      planByStudent.set(
+        String(student._id),
+        student.plan === "pro" ? "pro" : "free"
+      );
+    }
+  }
+
+  return applications.map((application) => {
+    const plan = planByStudent.get(String(application.studentId)) || "free";
+
+    return {
+      ...application,
+      studentPlan: plan,
+      studentIsPro: plan === "pro",
+    };
+  });
+}
+
+// Pro students get priority in the tutor's applicant queue. Keep newest-first
+// ordering within each plan group.
+function sortApplicationsByStudentPriority(applications) {
+  return [...applications].sort((left, right) => {
+    if (left.studentIsPro !== right.studentIsPro) {
+      return left.studentIsPro ? -1 : 1;
+    }
+
+    return (
+      new Date(right.createdAt || 0).getTime() -
+      new Date(left.createdAt || 0).getTime()
+    );
+  });
+}
+
+// Marks a verified Stripe Checkout Session as paid and upgrades the buyer.
+// This is the only place a user's plan is changed, so an upgrade can never
 // happen without Stripe confirming the payment.
 async function completeCheckoutSession(db, session) {
   if (!session?.id || session.payment_status !== "paid") return null;
@@ -140,19 +260,21 @@ async function completeCheckoutSession(db, session) {
   const userObjectId = toObjectId(userId);
   if (!userObjectId) return null;
 
-  // Only sessions created by /payments/checkout for the Tutor Pro product may
+  // Only sessions created by /payments/checkout for one of our paid plans may
   // upgrade a plan. This prevents an unrelated paid session from being used.
-  if (session.metadata?.plan !== "tutor_pro") return null;
+  const plan = session.metadata?.plan;
+  const planConfig = PRO_PLANS[plan];
+  if (!planConfig) return null;
 
   const users = db.collection("user");
   const user = await users.findOne({ _id: userObjectId });
-  if (!user || user.role !== "tutor") return null;
+  if (!user || user.role !== planConfig.role) return null;
 
   const payments = db.collection("payments");
   const existing = await payments.findOne({ stripeSessionId: session.id });
 
   if (existing?.status === "completed") {
-    return { userId, alreadyCompleted: true };
+    return { userId, plan, alreadyCompleted: true };
   }
 
   const now = new Date();
@@ -161,32 +283,60 @@ async function completeCheckoutSession(db, session) {
       ? session.payment_intent
       : session.payment_intent?.id || "";
 
-  await payments.updateOne(
-    { stripeSessionId: session.id },
-    {
-      $set: {
-        userId,
-        userEmail:
-          session.customer_email || session.customer_details?.email || "",
-        plan: "tutor_pro",
-        amount: session.amount_total ?? PRO_PLAN_AMOUNT,
-        currency: session.currency || "usd",
-        stripePaymentIntentId: paymentIntentId,
-        status: "completed",
-        completedAt: now,
-        updatedAt: now,
-      },
-      $setOnInsert: { createdAt: now },
-    },
-    { upsert: true }
-  );
+  const paymentUpdate = {
+    userId,
+    userEmail:
+      session.customer_email || session.customer_details?.email || "",
+    plan,
+    amount: session.amount_total ?? planConfig.amount,
+    currency: session.currency || "usd",
+    stripePaymentIntentId: paymentIntentId,
+    status: "completed",
+    completedAt: now,
+    updatedAt: now,
+  };
+
+  // Claim the pending payment atomically so concurrent webhook/verify calls
+  // cannot both apply the same upgrade. A filtered update only matches a
+  // record that is not already completed; if another request won the race we
+  // treat this call as an idempotent replay.
+  let claimed = null;
+
+  try {
+    claimed = await payments.findOneAndUpdate(
+      { stripeSessionId: session.id, status: { $ne: "completed" } },
+      { $set: paymentUpdate, $setOnInsert: { createdAt: now } },
+      { upsert: true, returnDocument: "after" }
+    );
+  } catch (error) {
+    if (error?.code !== 11000) throw error;
+
+    // A concurrent upsert hit the unique stripeSessionId index. Re-read below
+    // and treat an already-completed record as a replay.
+  }
+
+  if (!claimed) {
+    const current = await payments.findOne({ stripeSessionId: session.id });
+
+    if (current?.status === "completed") {
+      return { userId, plan, alreadyCompleted: true };
+    }
+
+    // The pending record was missing and the upsert conflicted; create or
+    // complete it now.
+    await payments.updateOne(
+      { stripeSessionId: session.id },
+      { $set: paymentUpdate, $setOnInsert: { createdAt: now } },
+      { upsert: true }
+    );
+  }
 
   await users.updateOne(
     { _id: userObjectId },
     { $set: { plan: "pro", proSince: now, updatedAt: now } }
   );
 
-  return { userId, alreadyCompleted: false };
+  return { userId, plan, alreadyCompleted: false };
 }
 
 async function getAuthUser(req, db) {
@@ -213,6 +363,7 @@ async function getAuthUser(req, db) {
     email: user.email || "",
     role: user.role || "student",
     plan: user.plan || "free",
+    proSince: user.proSince || null,
     phone: user.phone || "",
   };
 }
@@ -233,6 +384,30 @@ function requireAuth(db) {
       next(error);
     }
   };
+}
+
+// Admin-only guard. Must always run after requireAuth so req.user is loaded
+// from the database rather than trusted from the client.
+function verifyAdmin(req, res, next) {
+  if (req.user?.role !== "admin") {
+    res.status(403).json({ message: "Only admins can access this resource." });
+    return;
+  }
+
+  next();
+}
+
+function toPlanName(plan) {
+  if (plan === "student_pro") return "Student Pro";
+  if (plan === "tutor_pro") return "Tutor Pro";
+
+  if (!plan) return "—";
+
+  return String(plan)
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function validateTuitionUpdate(body = {}) {
@@ -321,6 +496,8 @@ async function startServer() {
   const tuitions = db.collection("tuitions");
   const applications = db.collection("applications");
   const payments = db.collection("payments");
+  const savedTuitions = db.collection("savedTuitions");
+  const usersCollection = db.collection("user");
   const auth = requireAuth(db);
 
   
@@ -368,6 +545,18 @@ async function startServer() {
       {
         key: { userId: 1, createdAt: -1 },
         name: "user_payments",
+      },
+    ]);
+
+    await savedTuitions.createIndexes([
+      {
+        key: { studentId: 1, tuitionId: 1 },
+        unique: true,
+        name: "unique_student_saved_tuition",
+      },
+      {
+        key: { studentId: 1, createdAt: -1 },
+        name: "student_saved_recent",
       },
     ]);
   } catch (error) {
@@ -449,68 +638,512 @@ async function startServer() {
   app.get("/health", (req, res) => {
     res.send({ status: "ok" });
   });
+//          my get applications
 
-  /* ------------------------ Profile Update ------------------------ */
 
-app.patch("/profile", auth, async (req, res) => {
+
+  app.get("/student/applications", auth, async (req, res) => {
   try {
-    const { name, phone, bio, image } = req.body;
-
-    if (!name || typeof name !== "string" || !name.trim()) {
-      return res.status(400).json({
-        message: "Name is required.",
+    if (req.user.role !== "student") {
+      return res.status(403).json({
+        message: "Only students can access their applications.",
       });
     }
 
-    const userId = toObjectId(req.user.id);
+    const data = await applications
+      .find({ studentId: req.user.id })
+      .sort({ createdAt: -1 })
+      .toArray();
 
-    if (!userId) {
-      return res.status(400).json({
-        message: "Invalid user ID.",
-      });
-    }
+    const tuitionIds = data
+      .map((application) => toObjectId(application.tuitionId))
+      .filter(Boolean);
 
-    const updatedUser = await db.collection("user").findOneAndUpdate(
-      { _id: userId },
-      {
-        $set: {
-          name: name.trim(),
-          phone: typeof phone === "string" ? phone.trim() : "",
-          bio: typeof bio === "string" ? bio.trim() : "",
-          image: typeof image === "string" ? image : "",
-          updatedAt: new Date(),
-        },
-      },
-      {
-        returnDocument: "after",
-      }
+    const tuitionData = await tuitions
+      .find({ _id: { $in: tuitionIds } })
+      .toArray();
+
+    const tuitionMap = new Map(
+      tuitionData.map((tuition) => [
+        tuition._id.toString(),
+        tuition,
+      ])
     );
 
-    if (!updatedUser) {
-      return res.status(404).json({
-        message: "User not found.",
-      });
-    }
+    const result = data.map((application) => {
+      const tuition = tuitionMap.get(application.tuitionId);
 
-    res.json({
-      message: "Profile updated successfully.",
-      user: {
-        id: String(updatedUser._id),
-        name: updatedUser.name,
-        email: updatedUser.email,
-        phone: updatedUser.phone || "",
-        bio: updatedUser.bio || "",
-        image: updatedUser.image || "",
-      },
+      return {
+        ...toPublicApplication(application),
+        tutorName: tuition?.tutorName || "Unknown Tutor",
+        tutorEmail: application.tutorEmail || tuition?.tutorEmail || "",
+        monthlyFee: Number(tuition?.monthlyFee) || 0,
+      };
     });
+
+    res.send(result);
   } catch (error) {
-    console.error("Profile update error:", error);
+    console.error("Get student applications error:", error);
 
     res.status(500).json({
-      message: "Failed to update profile.",
+      message: "Failed to load applications.",
     });
   }
 });
+//     cenceled applications
+
+app.delete("/applications/:id", auth, async (req, res) => {
+  try {
+    if (req.user.role !== "student") {
+      return res.status(403).json({
+        message: "Only students can cancel applications.",
+      });
+    }
+
+    const applicationId = toObjectId(req.params.id);
+
+    if (!applicationId) {
+      return res.status(400).json({
+        message: "Invalid application ID.",
+      });
+    }
+
+    const application = await applications.findOne({
+      _id: applicationId,
+    });
+
+    if (!application) {
+      return res.status(404).json({
+        message: "Application not found.",
+      });
+    }
+
+    if (application.studentId !== req.user.id) {
+      return res.status(403).json({
+        message: "You cannot cancel someone else's application.",
+      });
+    }
+
+    if (application.status !== "pending") {
+      return res.status(400).json({
+        message: "Only pending applications can be cancelled.",
+      });
+    }
+
+    const result = await applications.deleteOne({
+      _id: applicationId,
+      studentId: req.user.id,
+      status: "pending",
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(400).json({
+        message: "Application could not be cancelled.",
+      });
+    }
+
+    res.send({
+      message: "Application cancelled successfully.",
+    });
+  } catch (error) {
+    console.error("Cancel application error:", error);
+
+    res.status(500).json({
+      message: "Failed to cancel application.",
+    });
+  }
+});
+  /* ------------------------ Student overview ------------------------ */
+
+  // Aggregate dashboard data for the signed-in student only.
+  app.get("/student/overview", auth, async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res.status(403).json({
+          message: "Only students can access the student dashboard.",
+        });
+      }
+
+      const applicationFilter = { studentId: req.user.id };
+
+      const [
+        totalApplications,
+        pendingApplications,
+        acceptedApplications,
+        rejectedApplications,
+        savedCount,
+        recentApplications,
+      ] = await Promise.all([
+        applications.countDocuments(applicationFilter),
+        applications.countDocuments({ ...applicationFilter, status: "pending" }),
+        applications.countDocuments({
+          ...applicationFilter,
+          status: "accepted",
+        }),
+        applications.countDocuments({
+          ...applicationFilter,
+          status: "rejected",
+        }),
+        savedTuitions.countDocuments({ studentId: req.user.id }),
+        applications
+          .find(applicationFilter)
+          .sort({ createdAt: -1 })
+          .limit(5)
+          .toArray(),
+      ]);
+
+      const tuitionIds = recentApplications
+        .map((application) => toObjectId(application.tuitionId))
+        .filter(Boolean);
+
+      const tuitionData = tuitionIds.length
+        ? await tuitions.find({ _id: { $in: tuitionIds } }).toArray()
+        : [];
+      const tuitionMap = new Map(
+        tuitionData.map((tuition) => [String(tuition._id), tuition])
+      );
+
+      res.json({
+        stats: {
+          totalApplications,
+          pendingApplications,
+          acceptedApplications,
+          rejectedApplications,
+          savedTuitions: savedCount,
+          plan: req.user.plan || "free",
+        },
+        recentApplications: recentApplications.map((application) => {
+          const tuition = tuitionMap.get(String(application.tuitionId));
+
+          return {
+            ...toPublicApplication(application),
+            tutorName: tuition?.tutorName || "Unknown Tutor",
+            tutorEmail: application.tutorEmail || tuition?.tutorEmail || "",
+            monthlyFee: Number(tuition?.monthlyFee) || 0,
+          };
+        }),
+      });
+    } catch (error) {
+      console.error("Student overview error:", error);
+      res.status(500).json({ message: "Failed to load your dashboard." });
+    }
+  });
+
+  /* ------------------------ Student plan ------------------------ */
+
+  // Current plan and Student Pro price for the signed-in student.
+  app.get("/student/plan", auth, async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res.status(403).json({
+          message: "Only students can access the student plan.",
+        });
+      }
+
+      const plan = req.user.plan === "pro" ? "pro" : "free";
+      const isPro = plan === "pro";
+      const savedCount = await savedTuitions.countDocuments({
+        studentId: req.user.id,
+      });
+      const savedLimit = isPro ? null : FREE_SAVED_TUITION_LIMIT;
+
+      res.json({
+        plan,
+        status: isPro ? "active" : "free",
+        isPro,
+        price: PRO_PLANS.student_pro.amount,
+        currency: "usd",
+        // Student Pro is a one-time purchase in the blueprint, so there is no
+        // expiry date. Stripe Checkout session expiry is handled by the
+        // webhook (checkout.session.expired) without ever downgrading a user.
+        since: isPro ? req.user.proSince || null : null,
+        expiresAt: null,
+        savedCount,
+        savedLimit,
+        canSaveMore: isPro || savedCount < FREE_SAVED_TUITION_LIMIT,
+      });
+    } catch (error) {
+      console.error("Student plan error:", error);
+      res.status(500).json({ message: "Failed to load your plan." });
+    }
+  });
+
+  /* ------------------------ Saved tuitions ------------------------ */
+
+  // Saved tuition posts for the signed-in student, newest first.
+  app.get("/saved-tuitions", auth, async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res.status(403).json({
+          message: "Only students can access saved tuitions.",
+        });
+      }
+
+      const saved = await savedTuitions
+        .find({ studentId: req.user.id })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      const tuitionIds = saved
+        .map((entry) => toObjectId(entry.tuitionId))
+        .filter(Boolean);
+
+      if (tuitionIds.length === 0) {
+        return res.json([]);
+      }
+
+      const tuitionData = await tuitions
+        .find({ _id: { $in: tuitionIds } })
+        .toArray();
+      const tuitionMap = new Map(
+        tuitionData.map((tuition) => [String(tuition._id), tuition])
+      );
+
+      const result = saved
+        .map((entry) => {
+          const tuition = tuitionMap.get(String(entry.tuitionId));
+          if (!tuition) return null;
+
+          return {
+            ...toPublicTuition(tuition),
+            savedAt: entry.createdAt,
+          };
+        })
+        .filter(Boolean);
+
+      res.json(result);
+    } catch (error) {
+      console.error("Get saved tuitions error:", error);
+      res.status(500).json({ message: "Failed to load saved tuitions." });
+    }
+  });
+
+  // Save a tuition for the signed-in student. Saving twice is a no-op.
+  app.post("/saved-tuitions", auth, async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res.status(403).json({
+          message: "Only students can save tuitions.",
+        });
+      }
+
+      const tuitionId =
+        typeof req.body?.tuitionId === "string" ? req.body.tuitionId : "";
+      const tuitionObjectId = toObjectId(tuitionId);
+
+      if (!tuitionObjectId) {
+        return res.status(400).json({ message: "Invalid tuition ID." });
+      }
+
+      const tuition = await tuitions.findOne({ _id: tuitionObjectId });
+
+      if (!tuition) {
+        return res.status(404).json({ message: "Tuition not found." });
+      }
+
+      const existing = await savedTuitions.findOne({
+        studentId: req.user.id,
+        tuitionId: String(tuition._id),
+      });
+
+      // Saving the same tuition twice stays a no-op, even when the free plan
+      // is already at its bookmark limit.
+      if (existing) {
+        return res.json({
+          tuitionId: String(tuition._id),
+          saved: true,
+          message: "Tuition already saved.",
+        });
+      }
+
+      if (req.user.plan !== "pro") {
+        const savedCount = await savedTuitions.countDocuments({
+          studentId: req.user.id,
+        });
+
+        if (savedCount >= FREE_SAVED_TUITION_LIMIT) {
+          return res.status(403).json({
+            code: "PLAN_LIMIT",
+            message: `Free plan allows up to ${FREE_SAVED_TUITION_LIMIT} saved tuitions. Upgrade to Student Pro for unlimited bookmarks.`,
+            plan: "free",
+            limit: FREE_SAVED_TUITION_LIMIT,
+            savedCount,
+          });
+        }
+      }
+
+      await savedTuitions.updateOne(
+        { studentId: req.user.id, tuitionId: String(tuition._id) },
+        { $setOnInsert: { createdAt: new Date() } },
+        { upsert: true }
+      );
+
+      res.status(201).json({
+        tuitionId: String(tuition._id),
+        saved: true,
+        message: "Tuition saved.",
+      });
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.json({
+          tuitionId: req.body?.tuitionId,
+          saved: true,
+          message: "Tuition already saved.",
+        });
+      }
+
+      console.error("Save tuition error:", error);
+      res.status(500).json({ message: "Failed to save tuition." });
+    }
+  });
+
+  // Remove a saved tuition. Removing something that is not saved is a no-op.
+  app.delete("/saved-tuitions/:tuitionId", auth, async (req, res) => {
+    try {
+      if (req.user.role !== "student") {
+        return res.status(403).json({
+          message: "Only students can remove saved tuitions.",
+        });
+      }
+
+      const tuitionObjectId = toObjectId(req.params.tuitionId);
+
+      if (!tuitionObjectId) {
+        return res.status(400).json({ message: "Invalid tuition ID." });
+      }
+
+      await savedTuitions.deleteOne({
+        studentId: req.user.id,
+        tuitionId: String(tuitionObjectId),
+      });
+
+      res.json({
+        tuitionId: String(tuitionObjectId),
+        saved: false,
+        message: "Tuition removed from saved list.",
+      });
+    } catch (error) {
+      console.error("Remove saved tuition error:", error);
+      res.status(500).json({ message: "Failed to remove saved tuition." });
+    }
+  });
+
+  /* ------------------------ Profile Update ------------------------ */
+
+  // Full profile for the signed-in user. BetterAuth's session does not include
+  // optional profile fields (phone/address/bio), so the profile page needs a
+  // dedicated read endpoint.
+  app.get("/profile", auth, async (req, res) => {
+    try {
+      const userId = toObjectId(req.user.id);
+
+      if (!userId) {
+        return res.status(400).json({ message: "Invalid user ID." });
+      }
+
+      const user = await db.collection("user").findOne({ _id: userId });
+
+      if (!user) {
+        return res.status(404).json({ message: "User not found." });
+      }
+
+      res.json(toPublicProfile(user));
+    } catch (error) {
+      console.error("Profile read error:", error);
+      res.status(500).json({ message: "Failed to load your profile." });
+    }
+  });
+
+  // Partial profile update. Email, role, and plan can never be changed here.
+  app.patch("/profile", auth, async (req, res) => {
+    try {
+      const { name, phone, address, bio, image } = req.body ?? {};
+      const update = {};
+
+      if (name !== undefined) {
+        if (typeof name !== "string" || !name.trim()) {
+          return res.status(400).json({ message: "Name is required." });
+        }
+        if (name.trim().length > 80) {
+          return res
+            .status(400)
+            .json({ message: "Name must be 80 characters or fewer." });
+        }
+        update.name = name.trim();
+      }
+
+      if (phone !== undefined) {
+        if (typeof phone !== "string") {
+          return res.status(400).json({ message: "Phone must be a string." });
+        }
+        if (phone.trim().length > 30) {
+          return res
+            .status(400)
+            .json({ message: "Phone must be 30 characters or fewer." });
+        }
+        update.phone = phone.trim();
+      }
+
+      if (address !== undefined) {
+        if (typeof address !== "string") {
+          return res.status(400).json({ message: "Address must be a string." });
+        }
+        if (address.trim().length > 200) {
+          return res
+            .status(400)
+            .json({ message: "Address must be 200 characters or fewer." });
+        }
+        update.address = address.trim();
+      }
+
+      if (bio !== undefined) {
+        if (typeof bio !== "string") {
+          return res.status(400).json({ message: "Bio must be a string." });
+        }
+        if (bio.trim().length > 1000) {
+          return res
+            .status(400)
+            .json({ message: "Bio must be 1000 characters or fewer." });
+        }
+        update.bio = bio.trim();
+      }
+
+      if (image !== undefined) {
+        if (typeof image !== "string") {
+          return res.status(400).json({ message: "Image must be a URL string." });
+        }
+        update.image = image.trim();
+      }
+
+      if (Object.keys(update).length === 0) {
+        return res.status(400).json({ message: "No changes were provided." });
+      }
+
+      const userId = toObjectId(req.user.id);
+
+      if (!userId) {
+        return res.status(400).json({ message: "Invalid user ID." });
+      }
+
+      const updatedUser = await db.collection("user").findOneAndUpdate(
+        { _id: userId },
+        { $set: { ...update, updatedAt: new Date() } },
+        { returnDocument: "after" }
+      );
+
+      if (!updatedUser) {
+        return res.status(404).json({ message: "User not found." });
+      }
+
+      res.json({
+        message: "Profile updated successfully.",
+        user: toPublicProfile(updatedUser),
+      });
+    } catch (error) {
+      console.error("Profile update error:", error);
+      res.status(500).json({ message: "Failed to update profile." });
+    }
+  });
 
   /* ---------------------------- Create ---------------------------- */
 
@@ -892,12 +1525,15 @@ app.get("/add-tuitions", async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
+    const applicationsWithPlans = await withStudentPlans(db, data);
+
     res.json(
-      data.map((application) =>
-        withTuitionDetails(
-          application,
-          tuitionMap.get(String(application.tuitionId))
-        )
+      sortApplicationsByStudentPriority(applicationsWithPlans).map(
+        (application) =>
+          withTuitionDetails(
+            application,
+            tuitionMap.get(String(application.tuitionId))
+          )
       )
     );
   });
@@ -924,6 +1560,11 @@ app.get("/add-tuitions", async (req, res) => {
         .toArray(),
     ]);
 
+    const recentApplicationsWithPlans = await withStudentPlans(
+      db,
+      recentApplications
+    );
+
     res.json({
       stats: {
         totalTuitions: ownTuitions.length,
@@ -935,7 +1576,7 @@ app.get("/add-tuitions", async (req, res) => {
         plan: req.user.plan || "free",
       },
       recentTuitions: ownTuitions.slice(0, 5).map(toPublicTuition),
-      recentApplicants: recentApplications.map((application) =>
+      recentApplicants: recentApplicationsWithPlans.map((application) =>
         withTuitionDetails(
           application,
           tuitionMap.get(String(application.tuitionId))
@@ -959,9 +1600,266 @@ app.get("/add-tuitions", async (req, res) => {
     });
   });
 
+  /* ---------------------------- Admin ---------------------------- */
+
+  // Dashboard statistics for the admin overview. Counts are read live from
+  // MongoDB so the cards always match the collections.
+  app.get("/admin/overview", auth, verifyAdmin, async (req, res) => {
+    try {
+      const [
+        totalUsers,
+        totalStudents,
+        totalTutors,
+        totalAdmins,
+        totalTuitions,
+        pendingTuitions,
+        approvedTuitions,
+        rejectedTuitions,
+        completedPayments,
+        revenueResult,
+      ] = await Promise.all([
+        usersCollection.countDocuments({}),
+        usersCollection.countDocuments({ role: "student" }),
+        usersCollection.countDocuments({ role: "tutor" }),
+        usersCollection.countDocuments({ role: "admin" }),
+        tuitions.countDocuments({}),
+        tuitions.countDocuments({
+          $or: [
+            { approvalStatus: "pending" },
+            { approvalStatus: { $exists: false } },
+          ],
+        }),
+        tuitions.countDocuments({ approvalStatus: "approved" }),
+        tuitions.countDocuments({ approvalStatus: "rejected" }),
+        payments.countDocuments({ status: "completed" }),
+        payments
+          .aggregate([
+            { $match: { status: "completed" } },
+            {
+              $group: {
+                _id: null,
+                total: { $sum: { $ifNull: ["$amount", 0] } },
+              },
+            },
+          ])
+          .toArray(),
+      ]);
+
+      res.json({
+        stats: {
+          totalUsers,
+          totalStudents,
+          totalTutors,
+          totalAdmins,
+          totalTuitions,
+          pendingTuitions,
+          approvedTuitions,
+          rejectedTuitions,
+          completedPayments,
+          // Stripe stores amounts in cents.
+          totalRevenue: Number(revenueResult[0]?.total) || 0,
+          currency: "usd",
+        },
+      });
+    } catch (error) {
+      console.error("Admin overview error:", error);
+      res.status(500).json({ message: "Failed to load admin statistics." });
+    }
+  });
+
+  // All registered users, newest first. Admin-only.
+  app.get("/admin/users", auth, verifyAdmin, async (req, res) => {
+    try {
+      const data = await usersCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.json(data.map(toAdminUser));
+    } catch (error) {
+      console.error("Admin users error:", error);
+      res.status(500).json({ message: "Failed to load users." });
+    }
+  });
+
+  // Change a user's role. Admin-only, and the role is validated against the
+  // three supported values before touching MongoDB.
+  app.patch("/admin/users/:id/role", auth, verifyAdmin, async (req, res) => {
+    try {
+      const { role } = req.body ?? {};
+
+      if (!["student", "tutor", "admin"].includes(role)) {
+        res.status(400).json({
+          message: "Role must be student, tutor, or admin.",
+        });
+        return;
+      }
+
+      const id = toObjectId(req.params.id);
+      if (!id) {
+        res.status(404).json({ message: "User not found." });
+        return;
+      }
+
+      if (String(id) === req.user.id) {
+        res
+          .status(400)
+          .json({ message: "You cannot change your own admin role." });
+        return;
+      }
+
+      const target = await usersCollection.findOne({ _id: id });
+      if (!target) {
+        res.status(404).json({ message: "User not found." });
+        return;
+      }
+
+      // Never leave the platform without an admin account.
+      if ((target.role || "student") === "admin" && role !== "admin") {
+        const adminCount = await usersCollection.countDocuments({
+          role: "admin",
+        });
+
+        if (adminCount <= 1) {
+          res.status(400).json({
+            message: "At least one admin account must remain.",
+          });
+          return;
+        }
+      }
+
+      const updated = await usersCollection.findOneAndUpdate(
+        { _id: id },
+        { $set: { role, updatedAt: new Date() } },
+        { returnDocument: "after" }
+      );
+
+      if (!updated) {
+        res.status(404).json({ message: "User not found." });
+        return;
+      }
+
+      res.json({
+        message: "User role updated successfully.",
+        user: toAdminUser(updated),
+      });
+    } catch (error) {
+      console.error("Admin role update error:", error);
+      res.status(500).json({ message: "Failed to update user role." });
+    }
+  });
+
+  // Every tutor-submitted tuition, newest first. Admin-only.
+  app.get("/admin/tuitions", auth, verifyAdmin, async (req, res) => {
+    try {
+      const data = await tuitions.find({}).sort({ createdAt: -1 }).toArray();
+
+      res.json(data.map(toPublicTuition));
+    } catch (error) {
+      console.error("Admin tuitions error:", error);
+      res.status(500).json({ message: "Failed to load tuitions." });
+    }
+  });
+
+  // Approve or reject a tuition. This is the only place approvalStatus changes,
+  // so the public list (approved + active only) stays consistent.
+  app.patch(
+    "/admin/tuitions/:id/approval",
+    auth,
+    verifyAdmin,
+    async (req, res) => {
+      try {
+        const { approvalStatus } = req.body ?? {};
+
+        if (!["approved", "rejected"].includes(approvalStatus)) {
+          res.status(400).json({
+            message: "Approval status must be approved or rejected.",
+          });
+          return;
+        }
+
+        const id = toObjectId(req.params.id);
+        if (!id) {
+          res.status(404).json({ message: "Tuition not found." });
+          return;
+        }
+
+        const updated = await tuitions.findOneAndUpdate(
+          { _id: id },
+          { $set: { approvalStatus, updatedAt: new Date() } },
+          { returnDocument: "after" }
+        );
+
+        if (!updated) {
+          res.status(404).json({ message: "Tuition not found." });
+          return;
+        }
+
+        res.json(toPublicTuition(updated));
+      } catch (error) {
+        console.error("Admin tuition approval error:", error);
+        res.status(500).json({ message: "Failed to update tuition status." });
+      }
+    }
+  );
+
+  // Successful payments only, with the buyer's current name/email/role joined
+  // from the users collection. Admin-only.
+  app.get("/admin/transactions", auth, verifyAdmin, async (req, res) => {
+    try {
+      const data = await payments
+        .find({ status: "completed" })
+        .sort({ completedAt: -1, updatedAt: -1 })
+        .toArray();
+
+      const userIds = [
+        ...new Set(data.map((payment) => payment.userId).filter(Boolean)),
+      ]
+        .map(toObjectId)
+        .filter(Boolean);
+
+      const users = userIds.length
+        ? await db
+            .collection("user")
+            .find({ _id: { $in: userIds } })
+            .project({ name: 1, email: 1, role: 1 })
+            .toArray()
+        : [];
+
+      const userMap = new Map(
+        users.map((user) => [String(user._id), user])
+      );
+
+      res.json(
+        data.map((payment) => {
+          const user = userMap.get(String(payment.userId));
+
+          return {
+            id: String(payment._id),
+            userName: user?.name || "Unknown user",
+            userEmail: user?.email || payment.userEmail || "",
+            role: user?.role || "unknown",
+            plan: payment.plan || "",
+            planName: toPlanName(payment.plan),
+            amount: Number(payment.amount) || 0,
+            currency: payment.currency || "usd",
+            status: payment.status,
+            transactionId:
+              payment.stripePaymentIntentId || payment.stripeSessionId || "",
+            paymentDate:
+              payment.completedAt || payment.updatedAt || payment.createdAt || null,
+          };
+        })
+      );
+    } catch (error) {
+      console.error("Admin transactions error:", error);
+      res.status(500).json({ message: "Failed to load transactions." });
+    }
+  });
+
   /* --------------------------- Payments --------------------------- */
 
-  // Creates a Stripe Checkout Session for the Tutor Pro plan.
+  // Creates a Stripe Checkout Session for a paid plan (Tutor Pro / Student Pro).
   app.post("/payments/checkout", auth, async (req, res) => {
     try {
       if (!stripe) {
@@ -969,8 +1867,28 @@ app.get("/add-tuitions", async (req, res) => {
         return;
       }
 
-      if (req.user.role !== "tutor") {
-        res.status(403).json({ message: "Only tutors can upgrade to Pro." });
+      // Keep backwards compatibility with older clients that do not send a
+      // plan and infer it from the signed-in user's role.
+      const requestedPlan =
+        typeof req.body?.plan === "string" && req.body.plan
+          ? req.body.plan
+          : req.user.role === "student"
+            ? "student_pro"
+            : "tutor_pro";
+      const planConfig = PRO_PLANS[requestedPlan];
+
+      if (!planConfig) {
+        res.status(400).json({ message: "Unknown payment plan." });
+        return;
+      }
+
+      if (req.user.role !== planConfig.role) {
+        res.status(403).json({
+          message:
+            planConfig.role === "student"
+              ? "Only students can upgrade to Student Pro."
+              : "Only tutors can upgrade to Tutor Pro.",
+        });
         return;
       }
 
@@ -983,26 +1901,29 @@ app.get("/add-tuitions", async (req, res) => {
         mode: "payment",
         customer_email: req.user.email,
         client_reference_id: req.user.id,
+        ...(planConfig.adaptivePricing === false
+          ? { adaptive_pricing: { enabled: false } }
+          : {}),
         metadata: {
           userId: req.user.id,
           userEmail: req.user.email,
-          plan: "tutor_pro",
+          plan: requestedPlan,
         },
         line_items: [
           {
             quantity: 1,
             price_data: {
               currency: "usd",
-              unit_amount: PRO_PLAN_AMOUNT,
+              unit_amount: planConfig.amount,
               product_data: {
-                name: "MentorLagbe Tutor Pro",
-                description: "Unlimited tuition posts on MentorLagbe.",
+                name: planConfig.name,
+                description: planConfig.description,
               },
             },
           },
         ],
-        success_url: `${CLIENT_URL}/dashboard/tutor/post-tuition?payment=success&session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${CLIENT_URL}/dashboard/tutor/post-tuition?payment=cancelled`,
+        success_url: `${CLIENT_URL}${planConfig.successPath}?payment=success&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${CLIENT_URL}${planConfig.cancelPath}?payment=cancelled`,
       });
 
       if (!session.url) {
@@ -1019,8 +1940,8 @@ app.get("/add-tuitions", async (req, res) => {
           $set: {
             userId: req.user.id,
             userEmail: req.user.email,
-            plan: "tutor_pro",
-            amount: PRO_PLAN_AMOUNT,
+            plan: requestedPlan,
+            amount: planConfig.amount,
             currency: "usd",
             status: "pending",
             updatedAt: now,
@@ -1033,6 +1954,7 @@ app.get("/add-tuitions", async (req, res) => {
       res.status(201).json({
         url: session.url,
         sessionId: session.id,
+        plan: requestedPlan,
         // The publishable key is available for future client-side Stripe
         // integrations; redirect Checkout only needs the session URL.
         publishableKey: STRIPE_PUBLISH_KEY,
@@ -1044,7 +1966,7 @@ app.get("/add-tuitions", async (req, res) => {
   });
 
   // Fallback for a delayed webhook: verifies the session directly with Stripe
-  // and upgrades the tutor only when Stripe reports the session as paid.
+  // and upgrades the buyer only when Stripe reports the session as paid.
   app.get("/payments/verify", auth, async (req, res) => {
     try {
       if (!stripe) {
@@ -1081,8 +2003,11 @@ app.get("/add-tuitions", async (req, res) => {
         return;
       }
 
-      if (session.metadata?.plan !== "tutor_pro") {
-        res.status(400).json({ message: "This is not a Tutor Pro payment." });
+      const plan = session.metadata?.plan;
+      if (!PRO_PLANS[plan]) {
+        res
+          .status(400)
+          .json({ message: "This is not a MentorLagbe Pro payment." });
         return;
       }
 
@@ -1094,10 +2019,37 @@ app.get("/add-tuitions", async (req, res) => {
         return;
       }
 
-      res.json({ plan: "pro", sessionId });
+      res.json({ plan: "pro", planType: plan, sessionId });
     } catch (error) {
       console.error("Failed to verify Stripe payment:", error);
       res.status(500).json({ message: "Failed to verify payment." });
+    }
+  });
+
+  // Payment history for the signed-in user (most recent first). Only the
+  // public transaction fields are returned.
+  app.get("/payments/mine", auth, async (req, res) => {
+    try {
+      const data = await payments
+        .find({ userId: req.user.id })
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .toArray();
+
+      res.json(
+        data.map((payment) => ({
+          id: String(payment._id),
+          plan: payment.plan,
+          amount: payment.amount,
+          currency: payment.currency,
+          status: payment.status,
+          createdAt: payment.createdAt,
+          completedAt: payment.completedAt,
+        }))
+      );
+    } catch (error) {
+      console.error("Get payments error:", error);
+      res.status(500).json({ message: "Failed to load payment history." });
     }
   });
 
