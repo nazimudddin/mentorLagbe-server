@@ -397,6 +397,17 @@ function verifyAdmin(req, res, next) {
   next();
 }
 
+// Tutor-only guard. Must run after requireAuth so the role comes from MongoDB
+// and is never taken from the client.
+function verifyTutor(req, res, next) {
+  if (req.user?.role !== "tutor") {
+    res.status(403).json({ message: "Only tutors can access this resource." });
+    return;
+  }
+
+  next();
+}
+
 function toPlanName(plan) {
   if (plan === "student_pro") return "Student Pro";
   if (plan === "tutor_pro") return "Tutor Pro";
@@ -1165,15 +1176,60 @@ app.delete("/applications/:id", auth, async (req, res) => {
         return;
       }
 
-      if (
-        !title ||
-        !subject ||
-        !classLevel ||
-        !mode ||
-        !description ||
-        Number(monthlyFee) <= 0
-      ) {
+      const titleText = typeof title === "string" ? title.trim() : "";
+      const subjectText = typeof subject === "string" ? subject.trim() : "";
+      const classLevelText =
+        typeof classLevel === "string" ? classLevel.trim() : "";
+      const descriptionText =
+        typeof description === "string" ? description.trim() : "";
+      const modeText = typeof mode === "string" ? mode.trim() : "";
+      const monthlyFeeValue = Number(monthlyFee);
+      const daysPerWeekValue = Number(daysPerWeek ?? 3);
+
+      if (!titleText || !subjectText || !classLevelText || !descriptionText) {
         res.status(400).send({ message: "Missing required tuition fields." });
+        return;
+      }
+
+      if (titleText.length < 5 || titleText.length > 120) {
+        res.status(400).send({
+          message: "Title must be between 5 and 120 characters.",
+        });
+        return;
+      }
+
+      if (subjectText.length > 80 || classLevelText.length > 60) {
+        res.status(400).send({ message: "Subject or class level is too long." });
+        return;
+      }
+
+      if (!["Online", "Offline"].includes(modeText)) {
+        res.status(400).send({ message: "Mode must be Online or Offline." });
+        return;
+      }
+
+      if (!Number.isFinite(monthlyFeeValue) || monthlyFeeValue <= 0) {
+        res.status(400).send({
+          message: "Monthly fee must be greater than 0.",
+        });
+        return;
+      }
+
+      if (
+        !Number.isInteger(daysPerWeekValue) ||
+        daysPerWeekValue < 1 ||
+        daysPerWeekValue > 7
+      ) {
+        res.status(400).send({
+          message: "Days per week must be between 1 and 7.",
+        });
+        return;
+      }
+
+      if (descriptionText.length < 30 || descriptionText.length > 2000) {
+        res.status(400).send({
+          message: "Description must be between 30 and 2000 characters.",
+        });
         return;
       }
 
@@ -1197,13 +1253,13 @@ app.delete("/applications/:id", auth, async (req, res) => {
 
       const now = new Date();
       const result = await tuitions.insertOne({
-        title: String(title).trim(),
-        subject: String(subject).trim(),
-        classLevel: String(classLevel).trim(),
-        mode,
-        monthlyFee: Number(monthlyFee),
-        daysPerWeek: Number(daysPerWeek) || 3,
-        description: String(description).trim(),
+        title: titleText,
+        subject: subjectText,
+        classLevel: classLevelText,
+        mode: modeText,
+        monthlyFee: monthlyFeeValue,
+        daysPerWeek: daysPerWeekValue,
+        description: descriptionText,
         bannerImage: typeof bannerImage === "string" ? bannerImage : "",
         tutorId: req.user.id,
         tutorName: req.user.name,
@@ -1310,16 +1366,25 @@ app.get("/add-tuitions", async (req, res) => {
 });
 
   // Only the logged-in tutor's tuitions. Must be declared before "/tuitions/:id".
-  app.get("/tuitions/mine", auth, async (req, res) => {
+  app.get("/tuitions/mine", auth, verifyTutor, async (req, res) => {
     const data = await tuitions
       .find(ownerFilter(req.user))
       .sort({ createdAt: -1 })
       .toArray();
 
-    res.json(data.map(toPublicTuition));
+    res.json(
+      await Promise.all(
+        data.map(async (tuition) => ({
+          ...toPublicTuition(tuition),
+          applicationsCount: await applications.countDocuments({
+            tuitionId: String(tuition._id),
+          }),
+        }))
+      )
+    );
   });
 
-  app.get("/tuitions/:id", auth, async (req, res) => {
+  app.get("/tuitions/:id", auth, verifyTutor, async (req, res) => {
     const id = toObjectId(req.params.id);
     if (!id) {
       res.status(404).json({ message: "Tuition not found." });
@@ -1342,7 +1407,7 @@ app.get("/add-tuitions", async (req, res) => {
 
   /* ---------------------------- Update ---------------------------- */
 
-  app.patch("/tuitions/:id", auth, async (req, res) => {
+  app.patch("/tuitions/:id", auth, verifyTutor, async (req, res) => {
     const id = toObjectId(req.params.id);
     if (!id) {
       res.status(404).json({ message: "Tuition not found." });
@@ -1366,8 +1431,13 @@ app.get("/add-tuitions", async (req, res) => {
       return;
     }
 
-    // approvalStatus and isActive are intentionally excluded so that editing a
-    // tuition never changes its moderation state.
+    // approvalStatus and isActive are intentionally excluded from client input.
+    // A corrected rejection must be moderated again before becoming public.
+    if (tuition.approvalStatus === "rejected") {
+      update.approvalStatus = "pending";
+      update.isActive = true;
+      update.rejectionReason = "";
+    }
     const updated = await tuitions.findOneAndUpdate(
       { _id: id },
       { $set: { ...update, updatedAt: new Date() } },
@@ -1377,7 +1447,7 @@ app.get("/add-tuitions", async (req, res) => {
     res.json(toPublicTuition(updated));
   });
 
-  app.patch("/tuitions/:id/active", auth, async (req, res) => {
+  app.patch("/tuitions/:id/active", auth, verifyTutor, async (req, res) => {
     const id = toObjectId(req.params.id);
     if (!id) {
       res.status(404).json({ message: "Tuition not found." });
@@ -1400,6 +1470,13 @@ app.get("/add-tuitions", async (req, res) => {
       return;
     }
 
+    if (tuition.approvalStatus !== "approved") {
+      res.status(422).json({
+        message: "Only approved tuitions can be activated or closed.",
+      });
+      return;
+    }
+
     const updated = await tuitions.findOneAndUpdate(
       { _id: id },
       { $set: { isActive: req.body.isActive, updatedAt: new Date() } },
@@ -1411,7 +1488,7 @@ app.get("/add-tuitions", async (req, res) => {
 
   /* ---------------------------- Delete ---------------------------- */
 
-  app.delete("/tuitions/:id", auth, async (req, res) => {
+  app.delete("/tuitions/:id", auth, verifyTutor, async (req, res) => {
     const id = toObjectId(req.params.id);
     if (!id) {
       res.status(404).json({ message: "Tuition not found." });
@@ -1429,6 +1506,19 @@ app.get("/add-tuitions", async (req, res) => {
       return;
     }
 
+    const acceptedApplication = await applications.findOne({
+      tuitionId: String(id),
+      status: "accepted",
+    });
+
+    if (acceptedApplication) {
+      res.status(422).json({
+        message: "An accepted tuition cannot be deleted. Close it instead.",
+      });
+      return;
+    }
+
+    await applications.deleteMany({ tuitionId: String(id) });
     await tuitions.deleteOne({ _id: id });
     res.json({ message: "Tuition deleted successfully." });
   });
@@ -1452,14 +1542,26 @@ app.get("/add-tuitions", async (req, res) => {
       }
 
       const noteText = typeof note === "string" ? note.trim() : "";
-      if (!noteText) {
-        res.status(400).json({ message: "Please add a note for the tutor." });
+      if (noteText.length < 20 || noteText.length > 1000) {
+        res.status(400).json({
+          message: "Your note must be between 20 and 1000 characters.",
+        });
         return;
       }
 
       const tuition = await tuitions.findOne({ _id: tuitionObjectId });
       if (!tuition) {
         res.status(404).json({ message: "Tuition not found." });
+        return;
+      }
+
+      if (
+        tuition.approvalStatus !== "approved" ||
+        tuition.isActive === false
+      ) {
+        res.status(422).json({
+          message: "Applications are only open for approved, active tuitions.",
+        });
         return;
       }
 
@@ -1509,7 +1611,7 @@ app.get("/add-tuitions", async (req, res) => {
   });
 
   // All applications belonging to the signed-in tutor's tuitions.
-  app.get("/tutor/applications", auth, async (req, res) => {
+  app.get("/tutor/applications", auth, verifyTutor, async (req, res) => {
     const ownTuitions = await tuitions.find(ownerFilter(req.user)).toArray();
     const tuitionMap = new Map(
       ownTuitions.map((tuition) => [String(tuition._id), tuition])
@@ -1539,7 +1641,7 @@ app.get("/add-tuitions", async (req, res) => {
   });
 
   // Summary data for the tutor overview dashboard.
-  app.get("/tutor/overview", auth, async (req, res) => {
+  app.get("/tutor/overview", auth, verifyTutor, async (req, res) => {
     const ownTuitions = await tuitions
       .find(ownerFilter(req.user))
       .sort({ createdAt: -1 })
@@ -1551,8 +1653,9 @@ app.get("/add-tuitions", async (req, res) => {
     const tuitionIds = [...tuitionMap.keys()];
     const applicationFilter = { tuitionId: { $in: tuitionIds } };
 
-    const [totalApplicants, recentApplications] = await Promise.all([
+    const [totalApplicants, acceptedApplications, recentApplications] = await Promise.all([
       applications.countDocuments(applicationFilter),
+      applications.countDocuments({ ...applicationFilter, status: "accepted" }),
       applications
         .find(applicationFilter)
         .sort({ createdAt: -1 })
@@ -1573,6 +1676,8 @@ app.get("/add-tuitions", async (req, res) => {
             tuition.approvalStatus === "approved" && tuition.isActive !== false
         ).length,
         totalApplicants,
+        acceptedApplications,
+        tuitionLimit: req.user.plan === "pro" ? null : FREE_TUITION_LIMIT,
         plan: req.user.plan || "free",
       },
       recentTuitions: ownTuitions.slice(0, 5).map(toPublicTuition),
@@ -1586,7 +1691,7 @@ app.get("/add-tuitions", async (req, res) => {
   });
 
   // Current plan and posting allowance for the signed-in tutor.
-  app.get("/tutor/plan", auth, async (req, res) => {
+  app.get("/tutor/plan", auth, verifyTutor, async (req, res) => {
     const tuitionCount = await tuitions.countDocuments(ownerFilter(req.user));
     const plan = req.user.plan === "pro" ? "pro" : "free";
     const limit = plan === "pro" ? null : FREE_TUITION_LIMIT;
@@ -2055,7 +2160,7 @@ app.get("/add-tuitions", async (req, res) => {
 
   // Accept or reject an application. Tutors may only review applications for
   // tuitions they own.
-  app.patch("/applications/:id/status", auth, async (req, res) => {
+  app.patch("/applications/:id/status", auth, verifyTutor, async (req, res) => {
     const { status } = req.body ?? {};
 
     if (!["accepted", "rejected"].includes(status)) {
@@ -2100,11 +2205,29 @@ app.get("/add-tuitions", async (req, res) => {
       return;
     }
 
+    const now = new Date();
     const updated = await applications.findOneAndUpdate(
       { _id: id },
-      { $set: { status, updatedAt: new Date() } },
+      { $set: { status, updatedAt: now } },
       { returnDocument: "after" }
     );
+
+    // Accepting a student fills the post: close it publicly and resolve every
+    // remaining pending application for the same tuition.
+    if (status === "accepted" && tuition) {
+      await tuitions.updateOne(
+        { _id: tuition._id },
+        { $set: { isActive: false, updatedAt: now } }
+      );
+      await applications.updateMany(
+        {
+          tuitionId: String(tuition._id),
+          status: "pending",
+          _id: { $ne: id },
+        },
+        { $set: { status: "rejected", updatedAt: now } }
+      );
+    }
 
     res.json(withTuitionDetails(updated, tuition));
   });
