@@ -1760,7 +1760,13 @@ app.get("/add-tuitions", async (req, res) => {
         revenueResult,
       ] = await Promise.all([
         usersCollection.countDocuments({}),
-        usersCollection.countDocuments({ role: "student" }),
+        usersCollection.countDocuments({
+          $or: [
+            { role: "student" },
+            { role: { $exists: false } },
+            { role: null },
+          ],
+        }),
         usersCollection.countDocuments({ role: "tutor" }),
         usersCollection.countDocuments({ role: "admin" }),
         tuitions.countDocuments({}),
@@ -1904,13 +1910,15 @@ app.get("/add-tuitions", async (req, res) => {
 
   // Approve or reject a tuition. This is the only place approvalStatus changes,
   // so the public list (approved + active only) stays consistent.
+  // Rejection reasons are stored on the tuition document so tutors can see why
+  // their post was rejected before editing and resubmitting.
   app.patch(
     "/admin/tuitions/:id/approval",
     auth,
     verifyAdmin,
     async (req, res) => {
       try {
-        const { approvalStatus } = req.body ?? {};
+        const { approvalStatus, reason, rejectionReason } = req.body ?? {};
 
         if (!["approved", "rejected"].includes(approvalStatus)) {
           res.status(400).json({
@@ -1925,9 +1933,28 @@ app.get("/add-tuitions", async (req, res) => {
           return;
         }
 
+        const cleanReason = (
+          typeof reason === "string"
+            ? reason
+            : typeof rejectionReason === "string"
+              ? rejectionReason
+              : ""
+        ).trim();
+
+        const updateFields = {
+          approvalStatus,
+          updatedAt: new Date(),
+        };
+
+        if (approvalStatus === "rejected") {
+          updateFields.rejectionReason = cleanReason;
+        } else if (approvalStatus === "approved") {
+          updateFields.rejectionReason = "";
+        }
+
         const updated = await tuitions.findOneAndUpdate(
           { _id: id },
-          { $set: { approvalStatus, updatedAt: new Date() } },
+          { $set: updateFields },
           { returnDocument: "after" }
         );
 
@@ -1959,10 +1986,22 @@ app.get("/add-tuitions", async (req, res) => {
         .map(toObjectId)
         .filter(Boolean);
 
-      const users = userIds.length
+      const userEmails = [
+        ...new Set(
+          data
+            .map((payment) => payment.userEmail)
+            .filter((email) => typeof email === "string" && email.trim())
+        ),
+      ];
+
+      const queryOr = [];
+      if (userIds.length > 0) queryOr.push({ _id: { $in: userIds } });
+      if (userEmails.length > 0) queryOr.push({ email: { $in: userEmails } });
+
+      const users = queryOr.length > 0
         ? await db
             .collection("user")
-            .find({ _id: { $in: userIds } })
+            .find({ $or: queryOr })
             .project({ name: 1, email: 1, role: 1 })
             .toArray()
         : [];
@@ -1970,10 +2009,19 @@ app.get("/add-tuitions", async (req, res) => {
       const userMap = new Map(
         users.map((user) => [String(user._id), user])
       );
+      const userEmailMap = new Map(
+        users
+          .filter((user) => user.email)
+          .map((user) => [user.email.toLowerCase(), user])
+      );
 
       res.json(
         data.map((payment) => {
-          const user = userMap.get(String(payment.userId));
+          const user =
+            userMap.get(String(payment.userId)) ||
+            (payment.userEmail
+              ? userEmailMap.get(payment.userEmail.toLowerCase())
+              : null);
 
           return {
             id: String(payment._id),
