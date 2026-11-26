@@ -703,7 +703,7 @@ async function startServer() {
 });
 //     cenceled applications
 
-app.delete("/applications/:id", auth, async (req, res) => {
+app.patch("/applications/:id/withdraw", auth, async (req, res) => {
   try {
     if (req.user.role !== "student") {
       return res.status(403).json({
@@ -741,13 +741,15 @@ app.delete("/applications/:id", auth, async (req, res) => {
       });
     }
 
-    const result = await applications.deleteOne({
+    const result = await applications.updateOne({
       _id: applicationId,
       studentId: req.user.id,
       status: "pending",
+    }, {
+      $set: { status: "withdrawn", updatedAt: new Date() },
     });
 
-    if (result.deletedCount === 0) {
+    if (result.modifiedCount === 0) {
       return res.status(400).json({
         message: "Application could not be cancelled.",
       });
@@ -755,6 +757,7 @@ app.delete("/applications/:id", auth, async (req, res) => {
 
     res.send({
       message: "Application cancelled successfully.",
+      status: "withdrawn",
     });
   } catch (error) {
     console.error("Cancel application error:", error);
@@ -950,6 +953,15 @@ app.delete("/applications/:id", auth, async (req, res) => {
 
       if (!tuition) {
         return res.status(404).json({ message: "Tuition not found." });
+      }
+
+      if (
+        tuition.approvalStatus !== "approved" ||
+        tuition.isActive === false
+      ) {
+        return res.status(422).json({
+          message: "Only approved, active tuitions can be saved.",
+        });
       }
 
       const existing = await savedTuitions.findOne({
@@ -1364,6 +1376,30 @@ app.get("/add-tuitions", async (req, res) => {
     });
   }
 });
+
+  // Public tuition details used by the student catalogue.  Keep this separate
+  // from the tutor-only management route below so a student can never read a
+  // pending, rejected, or closed post by guessing its id.
+  app.get("/public-tuitions/:id", async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) {
+      res.status(404).json({ message: "Tuition not found." });
+      return;
+    }
+
+    const tuition = await tuitions.findOne({
+      _id: id,
+      approvalStatus: "approved",
+      isActive: { $ne: false },
+    });
+
+    if (!tuition) {
+      res.status(404).json({ message: "Tuition not found or no longer available." });
+      return;
+    }
+
+    res.json(toPublicTuition(tuition));
+  });
 
   // Only the logged-in tutor's tuitions. Must be declared before "/tuitions/:id".
   app.get("/tuitions/mine", auth, verifyTutor, async (req, res) => {
