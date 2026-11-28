@@ -2,11 +2,37 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import cors from "cors";
 import Stripe from "stripe";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import "dotenv/config";
 
 const PORT = Number(process.env.PORT) || 5000;
 const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:3000";
 const DB_NAME = "mentor-lagbe";
+
+// BetterAuth runs in the Next.js app and publishes its public signing keys at
+// /api/auth/jwks. The API verifies every bearer token against those keys, then
+// loads the user from MongoDB so role/plan changes take effect immediately.
+const AUTH_URL = (
+  process.env.BETTER_AUTH_URL ||
+  process.env.NEXT_PUBLIC_APP_URL ||
+  "http://localhost:3000"
+).replace(/\/$/, "");
+const JWT_ISSUER = process.env.JWT_ISSUER || "mentorlagbe";
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE || "mentorlagbe";
+const JWT_ALGORITHMS = (process.env.JWT_ALGORITHMS || "EdDSA")
+  .split(",")
+  .map((algorithm) => algorithm.trim())
+  .filter(Boolean);
+
+let remoteJwks = null;
+
+function getRemoteJwks() {
+  if (!remoteJwks) {
+    remoteJwks = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
+  }
+
+  return remoteJwks;
+}
 
 // The existing .env uses these exact names (including the "SECRED" typo).
 const STRIPE_PUBLISH_KEY =
@@ -45,7 +71,40 @@ const PRO_PLANS = {
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 const app = express();
-app.use(cors({ origin: CLIENT_URL, credentials: true }));
+
+// The browser normally talks to Express through the Next.js proxy (same
+// origin), but direct clients are still supported. Never use "*" together with
+// credentials; keep an explicit allowlist for local and deployed origins.
+const ALLOWED_ORIGINS = Array.from(
+  new Set(
+    [
+      CLIENT_URL,
+      process.env.NEXT_PUBLIC_APP_URL,
+      process.env.BETTER_AUTH_URL,
+      process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : "",
+      ...(process.env.CLIENT_URLS || "").split(","),
+    ]
+      .map((origin) => origin?.trim().replace(/\/$/, ""))
+      .filter(Boolean)
+  )
+);
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Same-origin/server-to-server requests have no Origin header.
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(null, false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
@@ -339,22 +398,7 @@ async function completeCheckoutSession(db, session) {
   return { userId, plan, alreadyCompleted: false };
 }
 
-async function getAuthUser(req, db) {
-  const token = getSessionToken(req);
-  if (!token) return null;
-
-  const session = await db.collection("session").findOne({ token });
-  if (!session) return null;
-
-  if (session.expiresAt && new Date(session.expiresAt).getTime() < Date.now()) {
-    return null;
-  }
-
-  const userId = toObjectId(session.userId);
-  const user = await db
-    .collection("user")
-    .findOne(userId ? { _id: userId } : { id: String(session.userId) });
-
+function toAuthUser(user) {
   if (!user) return null;
 
   return {
@@ -368,7 +412,64 @@ async function getAuthUser(req, db) {
   };
 }
 
-function requireAuth(db) {
+async function findAuthUserById(db, id) {
+  if (!id) return null;
+
+  const userId = toObjectId(id);
+  const user = await db
+    .collection("user")
+    .findOne(userId ? { _id: userId } : { id: String(id) });
+
+  return toAuthUser(user);
+}
+
+// Primary authentication path: verify the BetterAuth JWT with the public JWKS
+// and load the fresh user from MongoDB. Loading the user (rather than trusting
+// JWT claims alone) means role and plan changes are effective immediately.
+async function getJwtUser(req, db) {
+  const authorization = req.headers.authorization || "";
+
+  if (!authorization.startsWith("Bearer ")) return null;
+
+  const token = authorization.slice("Bearer ".length).trim();
+  if (!token) return null;
+
+  try {
+    const { payload } = await jwtVerify(token, getRemoteJwks(), {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+      algorithms: JWT_ALGORITHMS,
+    });
+
+    const userId = payload.sub || payload.userId || payload.id;
+    return await findAuthUserById(db, userId);
+  } catch (error) {
+    console.warn("JWT verification failed:", error.message);
+    return null;
+  }
+}
+
+// Backwards-compatible fallback for direct clients that still send the
+// BetterAuth session cookie (for example local scripts or older deployments).
+async function getSessionUser(req, db) {
+  const token = getSessionToken(req);
+  if (!token) return null;
+
+  const session = await db.collection("session").findOne({ token });
+  if (!session) return null;
+
+  if (session.expiresAt && new Date(session.expiresAt).getTime() < Date.now()) {
+    return null;
+  }
+
+  return findAuthUserById(db, session.userId);
+}
+
+async function getAuthUser(req, db) {
+  return (await getJwtUser(req, db)) || (await getSessionUser(req, db));
+}
+
+function verifyToken(db) {
   return async (req, res, next) => {
     try {
       const user = await getAuthUser(req, db);
@@ -386,22 +487,29 @@ function requireAuth(db) {
   };
 }
 
-// Admin-only guard. Must always run after requireAuth so req.user is loaded
-// from the database rather than trusted from the client.
-function verifyAdmin(req, res, next) {
-  if (req.user?.role !== "admin") {
-    res.status(403).json({ message: "Only admins can access this resource." });
+// Role guards. They must always run after verifyToken so the role comes from
+// MongoDB and is never taken from the client or from stale JWT claims.
+function verifyStudent(req, res, next) {
+  if (req.user?.role !== "student") {
+    res.status(403).json({ message: "Only students can access this resource." });
     return;
   }
 
   next();
 }
 
-// Tutor-only guard. Must run after requireAuth so the role comes from MongoDB
-// and is never taken from the client.
 function verifyTutor(req, res, next) {
   if (req.user?.role !== "tutor") {
     res.status(403).json({ message: "Only tutors can access this resource." });
+    return;
+  }
+
+  next();
+}
+
+function verifyAdmin(req, res, next) {
+  if (req.user?.role !== "admin") {
+    res.status(403).json({ message: "Only admins can access this resource." });
     return;
   }
 
@@ -509,7 +617,7 @@ async function startServer() {
   const payments = db.collection("payments");
   const savedTuitions = db.collection("savedTuitions");
   const usersCollection = db.collection("user");
-  const auth = requireAuth(db);
+  const auth = verifyToken(db);
 
   
   try {
@@ -653,7 +761,7 @@ async function startServer() {
 
 
 
-  app.get("/student/applications", auth, async (req, res) => {
+  app.get("/student/applications", auth, verifyStudent, async (req, res) => {
   try {
     if (req.user.role !== "student") {
       return res.status(403).json({
@@ -703,7 +811,7 @@ async function startServer() {
 });
 //     cenceled applications
 
-app.patch("/applications/:id/withdraw", auth, async (req, res) => {
+app.patch("/applications/:id/withdraw", auth, verifyStudent, async (req, res) => {
   try {
     if (req.user.role !== "student") {
       return res.status(403).json({
@@ -770,7 +878,7 @@ app.patch("/applications/:id/withdraw", auth, async (req, res) => {
   /* ------------------------ Student overview ------------------------ */
 
   // Aggregate dashboard data for the signed-in student only.
-  app.get("/student/overview", auth, async (req, res) => {
+  app.get("/student/overview", auth, verifyStudent, async (req, res) => {
     try {
       if (req.user.role !== "student") {
         return res.status(403).json({
@@ -846,7 +954,7 @@ app.patch("/applications/:id/withdraw", auth, async (req, res) => {
   /* ------------------------ Student plan ------------------------ */
 
   // Current plan and Student Pro price for the signed-in student.
-  app.get("/student/plan", auth, async (req, res) => {
+  app.get("/student/plan", auth, verifyStudent, async (req, res) => {
     try {
       if (req.user.role !== "student") {
         return res.status(403).json({
@@ -885,7 +993,7 @@ app.patch("/applications/:id/withdraw", auth, async (req, res) => {
   /* ------------------------ Saved tuitions ------------------------ */
 
   // Saved tuition posts for the signed-in student, newest first.
-  app.get("/saved-tuitions", auth, async (req, res) => {
+  app.get("/saved-tuitions", auth, verifyStudent, async (req, res) => {
     try {
       if (req.user.role !== "student") {
         return res.status(403).json({
@@ -933,7 +1041,7 @@ app.patch("/applications/:id/withdraw", auth, async (req, res) => {
   });
 
   // Save a tuition for the signed-in student. Saving twice is a no-op.
-  app.post("/saved-tuitions", auth, async (req, res) => {
+  app.post("/saved-tuitions", auth, verifyStudent, async (req, res) => {
     try {
       if (req.user.role !== "student") {
         return res.status(403).json({
@@ -1021,7 +1129,7 @@ app.patch("/applications/:id/withdraw", auth, async (req, res) => {
   });
 
   // Remove a saved tuition. Removing something that is not saved is a no-op.
-  app.delete("/saved-tuitions/:tuitionId", auth, async (req, res) => {
+  app.delete("/saved-tuitions/:tuitionId", auth, verifyStudent, async (req, res) => {
     try {
       if (req.user.role !== "student") {
         return res.status(403).json({
@@ -1170,7 +1278,7 @@ app.patch("/applications/:id/withdraw", auth, async (req, res) => {
 
   /* ---------------------------- Create ---------------------------- */
 
-  app.post("/add-tuitions", auth, async (req, res) => {
+  app.post("/add-tuitions", auth, verifyTutor, async (req, res) => {
     try {
       const {
         title,
@@ -1562,7 +1670,7 @@ app.get("/add-tuitions", async (req, res) => {
   /* ------------------------- Applications ------------------------- */
 
   // Student-facing create endpoint (used by the future apply flow and tests).
-  app.post("/applications", auth, async (req, res) => {
+  app.post("/applications", auth, verifyStudent, async (req, res) => {
     try {
       if (req.user.role !== "student") {
         res.status(403).json({ message: "Only students can apply to tuitions." });
